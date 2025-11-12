@@ -105,19 +105,28 @@ export default function ComparePage() {
             </section>
 
             {/* By Theme */}
-            {narrative.by_theme.length > 0 && (
-              <section className="bg-[#2c2c2c] rounded-lg p-6 border border-[#3a3a3a]">
-                <h2 className="text-lg font-semibold mb-4">By Theme</h2>
-                <ul className="space-y-2">
-                  {narrative.by_theme.map((item, i) => (
-                    <li key={i} className="text-gray-300 flex items-start gap-2">
-                      <span className="text-blue-500 mt-1">•</span>
-                      <span>{item}</span>
-                    </li>
-                  ))}
-                </ul>
-              </section>
-            )}
+            {(() => {
+              // Handle both array and object formats
+              const byTheme = Array.isArray(narrative.by_theme) 
+                ? narrative.by_theme 
+                : typeof narrative.by_theme === 'object' && narrative.by_theme !== null
+                ? Object.entries(narrative.by_theme).map(([k, v]) => `${k}: ${v}`)
+                : [];
+              
+              return byTheme.length > 0 && (
+                <section className="bg-[#2c2c2c] rounded-lg p-6 border border-[#3a3a3a]">
+                  <h2 className="text-lg font-semibold mb-4">By Theme</h2>
+                  <ul className="space-y-2">
+                    {byTheme.map((item, i) => (
+                      <li key={i} className="text-gray-300 flex items-start gap-2">
+                        <span className="text-blue-500 mt-1">•</span>
+                        <span>{item}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+              );
+            })()}
 
             {/* Risks & Opportunities */}
             <div className="grid md:grid-cols-2 gap-6">
