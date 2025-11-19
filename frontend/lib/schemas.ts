@@ -10,73 +10,64 @@ export const BusinessZ = z.object({
 });
 export type Business = z.infer<typeof BusinessZ>;
 
-export const ThemeZ = z.object({
-  theme: z.string(),
-  score: z.number(),
-  delta: z.number().nullable().optional(),
-});
-
-export const OverviewZ = z.object({
-  business: z.object({
-    id: z.string(),
-    name: z.string(),
-    city: z.string(),
-    stars: z.number(),
-  }),
-  themes: z.array(ThemeZ),
-  keywords: z.array(z.object({
-    term: z.string(),
-    count: z.number(),
-    tfidf: z.number(),
-  })),
-  insights: z.object({
-    love: z.array(z.string()),
-    improve: z.array(z.string()),
-    recommendations: z.array(z.string()),
-  }),
-  last_run: z.string().nullable(),
-});
-export type Overview = z.infer<typeof OverviewZ>;
-
-export const TrendRowZ = z.object({
-  month: z.string(),
-  avg_sentiment: z.number(),
+// Search businesses schema
+export const SearchBusinessZ = z.object({
+  id: z.string(),
+  name: z.string(),
+  city: z.string(),
   review_count: z.number(),
 });
-export const TrendsZ = z.array(TrendRowZ);
-export type Trends = z.infer<typeof TrendsZ>;
+export type SearchBusiness = z.infer<typeof SearchBusinessZ>;
 
-export const CompareZ = z.object({
-  themes: z.array(z.string()),
-  scores: z.array(z.record(z.string(), z.union([z.string(), z.number()]))),
-});
-export type CompareResp = z.infer<typeof CompareZ>;
-
-// KPIs schema
-export const KPIZ = z.object({
+// Date range schema
+export const DateRangeZ = z.object({
+  min_date: z.string(),
+  max_date: z.string(),
   total_reviews: z.number(),
-  sentiment_score: z.number(),
-  avg_stars: z.number(),
-  deltas: z.object({
-    reviews: z.number().nullable(),
-    sentiment: z.number().nullable(),
-    stars: z.number().nullable(),
-  }),
-  sparkline: z.array(z.object({
-    month: z.string(),
-    sentiment: z.number(),
-  })),
 });
-export type KPIs = z.infer<typeof KPIZ>;
+export type DateRange = z.infer<typeof DateRangeZ>;
 
-// Quotes schema
-export const QuotesZ = z.object({
-  quotes_by_theme: z.record(
+// Query response schema - handles both success and insufficient_data cases
+export const QueryResponseZ = z.object({
+  insufficient_data: z.boolean().optional(),
+  message: z.string().optional(),
+  matched_reviews: z.number().optional(),
+  total_reviews: z.number().optional(),
+  kpis: z.object({
+    matched_reviews: z.number(),
+    sentiment_score: z.number(),
+    avg_stars: z.number(),
+    deltas: z.object({
+      reviews: z.number(),
+      sentiment: z.number(),
+      stars: z.number(),
+    }),
+    sparkline: z.array(z.number()),
+  }).optional(),
+  time_series: z.array(z.object({
+    bucket: z.string(),
+    hits: z.number(),
+    avg_sentiment: z.number(),
+  })).optional(),
+  by_keyword: z.array(z.object({
+    term: z.string(),
+    hits: z.number(),
+    avg_sentiment: z.number(),
+  })).optional(),
+  quotes_by_keyword: z.record(
     z.string(),
     z.object({
       positive: z.array(z.string()),
       negative: z.array(z.string()),
     })
-  ),
+  ).optional(),
+  summary: z.object({
+    love: z.array(z.string()),
+    improve: z.array(z.string()),
+    recommendations: z.array(z.string()),
+  }).optional(),
+  summary_source: z.string().optional(),
+  share_of_voice: z.record(z.string(), z.number()).optional(),
+  generated_at: z.string().optional(),
 });
-export type Quotes = z.infer<typeof QuotesZ>;
+export type QueryResponse = z.infer<typeof QueryResponseZ>;

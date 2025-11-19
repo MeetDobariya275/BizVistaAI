@@ -1,5 +1,5 @@
 import axios from "axios";
-import { BusinessZ, OverviewZ, TrendsZ, CompareZ, KPIZ, QuotesZ } from "./schemas";
+import { BusinessZ, SearchBusinessZ, QueryResponseZ, DateRangeZ } from "./schemas";
 
 const base = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:4174/api";
 
@@ -19,93 +19,49 @@ export async function fetchBusinesses() {
   }
 }
 
-export async function fetchOverview(id: string | number) {
+export async function searchBusinesses(query: string = "") {
   try {
-    const { data } = await axios.get(`${base}/businesses/${id}/overview`, axiosConfig);
-    return OverviewZ.parse(data);
-  } catch (error) {
-    console.error("Error fetching overview:", error);
-    throw error;
-  }
-}
-
-export async function fetchTrends(id: string | number) {
-  try {
-    const { data } = await axios.get(`${base}/businesses/${id}/trends`, axiosConfig);
-    return TrendsZ.parse(data);
-  } catch (error) {
-    console.error("Error fetching trends:", error);
-    throw error;
-  }
-}
-
-export async function fetchCompare(ids: (string | number)[]) {
-  try {
-    console.log("Fetching compare with IDs:", ids);
-    const { data } = await axios.get(`${base}/compare`, {
+    const { data } = await axios.get(`${base}/search/businesses`, {
       ...axiosConfig,
-      params: { ids: ids.join(",") },
+      params: { q: query },
     });
-    console.log("Got compare data:", data);
-    
-    // Manual validation instead of Zod parse to avoid module issues
-    if (!data || !Array.isArray(data.themes) || !Array.isArray(data.scores)) {
-      throw new Error("Invalid compare data structure");
-    }
-    
-    return data as { themes: string[]; scores: Array<Record<string, string | number>> };
+    return SearchBusinessZ.array().parse(data);
   } catch (error) {
-    console.error("Error fetching compare:", error);
+    console.error("Error searching businesses:", error);
     throw error;
   }
 }
 
-export async function fetchCompareNarrative(ids: (string | number)[]) {
+export async function getBusinessDateRange(businessId: string) {
   try {
-    console.log("Fetching narrative compare with IDs:", ids);
-    const { data } = await axios.get(`${base}/compare-narrative`, {
-      ...axiosConfig,
-      params: { ids: ids.join(",") },
-    });
-    console.log("Got narrative data:", data);
-    return data as {
-      summary: string;
-      by_theme: string[];
-      risks: string[];
-      opportunities: string[];
-      overall_leader: string;
-      source: string;
-      cached: boolean;
-      generated_at: string;
-    };
+    const { data } = await axios.get(`${base}/businesses/${businessId}/date-range`, axiosConfig);
+    return DateRangeZ.parse(data);
   } catch (error) {
-    console.error("Error fetching narrative compare:", error);
+    console.error("Error fetching date range:", error);
     throw error;
   }
 }
 
-export async function fetchKPIs(id: string | number, period: string = "30d") {
+export async function queryKeywordAnalytics(
+  businessId: string,
+  startDate: string,
+  endDate: string,
+  keywords: string[]
+) {
   try {
-    const { data } = await axios.get(`${base}/businesses/${id}/kpis`, {
-      ...axiosConfig,
-      params: { period },
-    });
-    return KPIZ.parse(data);
+    const { data } = await axios.post(
+      `${base}/query`,
+      {
+        business_id: businessId,
+        start_date: startDate,
+        end_date: endDate,
+        keywords: keywords,
+      },
+      axiosConfig
+    );
+    return QueryResponseZ.parse(data);
   } catch (error) {
-    console.error("Error fetching KPIs:", error);
-    throw error;
-  }
-}
-
-export async function fetchQuotes(id: string | number, period: string = "30d") {
-  try {
-    const { data } = await axios.get(`${base}/businesses/${id}/quotes`, {
-      ...axiosConfig,
-      params: { period },
-    });
-    return QuotesZ.parse(data);
-  } catch (error) {
-    console.error("Error fetching quotes:", error);
+    console.error("Error querying keyword analytics:", error);
     throw error;
   }
 }
