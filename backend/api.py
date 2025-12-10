@@ -6,7 +6,7 @@ Endpoints for querying business data from SQLite database
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, Column, Integer, String, Float, Text, ForeignKey, Date, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, Float, Text, ForeignKey, Date, DateTime, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.orm import Session
@@ -14,9 +14,13 @@ from typing import List, Dict, Any, Optional
 import json
 import hashlib
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import structlog
+from rapidfuzz import fuzz
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from pydantic import BaseModel
+from typing import List as TypingList
 
 # Setup logging
 logger = structlog.get_logger()
@@ -480,54 +484,6 @@ async def compare_businesses_narrative(ids: str):
     finally:
         db.close()
 
-@app.get("/api/compare")
-async def compare_businesses(ids: str):
-    """Compare multiple businesses by themes"""
-    db = next(get_db())
-    
-    try:
-        # Parse business IDs
-        business_ids = [bid.strip() for bid in ids.split(',')]
-        
-        # Get all themes for these businesses
-        themes = db.query(Theme).filter(Theme.business_id.in_(business_ids)).all()
-        
-        # Get business info
-        businesses = db.query(Business).filter(Business.id.in_(business_ids)).all()
-        business_map = {b.id: b.name for b in businesses}
-        
-        # Get unique theme names
-        all_themes = sorted(set(t.theme for t in themes))
-        
-        # Build scores matrix
-        scores = []
-        for business_id in business_ids:
-            business_themes = {t.theme: t.score for t in themes if t.business_id == business_id}
-            
-            score_row = {
-                "business_id": business_id,
-                "name": business_map.get(business_id, "Unknown")
-            }
-            
-            for theme in all_themes:
-                score_row[theme] = business_themes.get(theme, 0.0)
-            
-            scores.append(score_row)
-        
-        result = {
-            "themes": all_themes,
-            "scores": scores
-        }
-        
-        logger.info("Returned comparison", businesses=len(business_ids))
-        return result
-    
-    except Exception as e:
-        logger.error("Error comparing businesses", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        db.close()
-
 @app.get("/api/businesses/{business_id}/kpis")
 async def get_business_kpis(business_id: str, period: str = "30d"):
     """Get KPIs for a business over a period"""
@@ -723,6 +679,638 @@ async def refresh_business(business_id: str, period: str = "30d"):
     except Exception as e:
         logger.error("Error in refresh endpoint", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
+
+# In-memory cache for query results
+_query_cache: Dict[str, Dict[str, Any]] = {}
+_cache_ttl = 24 * 60 * 60  # 24 hours in seconds
+
+def _get_cache_key(business_id: str, start_date: str, end_date: str, keywords: List[str]) -> str:
+    """Generate cache key from query parameters"""
+    sorted_keywords = sorted([k.lower().strip() for k in keywords])
+    key_str = f"{business_id}|{start_date}|{end_date}|{','.join(sorted_keywords)}"
+    return hashlib.sha256(key_str.encode()).hexdigest()
+
+def _is_cache_valid(cache_entry: Dict[str, Any]) -> bool:
+    """Check if cache entry is still valid"""
+    if 'timestamp' not in cache_entry:
+        return False
+    age = (datetime.now() - cache_entry['timestamp']).total_seconds()
+    return age < _cache_ttl
+
+# VADER sentiment analyzer (reuse for keyword queries)
+_vader_analyzer = SentimentIntensityAnalyzer()
+
+def _match_keyword_in_text(text: str, keyword: str) -> bool:
+    """Match keyword using exact phrase first, then fuzzy >= 85"""
+    text_lower = text.lower()
+    keyword_lower = keyword.lower().strip()
+    
+    # Exact phrase match
+    if keyword_lower in text_lower:
+        return True
+    
+    # Fuzzy match with rapidfuzz
+    # Try matching against words and phrases in text
+    words = text_lower.split()
+    for i in range(len(words)):
+        for j in range(i + 1, min(i + 5, len(words) + 1)):  # Check up to 4-word phrases
+            phrase = ' '.join(words[i:j])
+            ratio = fuzz.partial_ratio(keyword_lower, phrase)
+            if ratio >= 85:
+                return True
+    
+    return False
+
+@app.get("/api/businesses/{business_id}/date-range")
+async def get_business_date_range(business_id: str):
+    """Get available date range for a business's reviews"""
+    db = next(get_db())
+    
+    try:
+        from sqlalchemy import func
+        
+        # Get min and max dates for this business
+        result = db.query(
+            func.min(Review.date).label('min_date'),
+            func.max(Review.date).label('max_date'),
+            func.count(Review.id).label('total_reviews')
+        ).filter(Review.business_id == business_id).first()
+        
+        if not result or result.total_reviews == 0:
+            raise HTTPException(status_code=404, detail="No reviews found for this business")
+        
+        return {
+            "min_date": result.min_date.isoformat() if result.min_date else None,
+            "max_date": result.max_date.isoformat() if result.max_date else None,
+            "total_reviews": result.total_reviews
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Error fetching date range", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+@app.get("/api/search/businesses")
+async def search_businesses(q: str = ""):
+    """Search businesses by name (returns top 10 matches)"""
+    db = next(get_db())
+    
+    try:
+        if not q or len(q.strip()) < 1:
+            # Return all businesses if no query
+            businesses = db.query(Business).order_by(Business.review_count.desc()).limit(10).all()
+        else:
+            # Search by name (case-insensitive LIKE - SQLite uses lower() for case-insensitive)
+            search_term = f"%{q.strip().lower()}%"
+            businesses = db.query(Business).filter(
+                func.lower(Business.name).like(search_term)
+            ).order_by(Business.review_count.desc()).limit(10).all()
+        
+        results = [
+            {
+                "id": b.id,
+                "name": b.name,
+                "city": b.city or "",
+                "review_count": b.review_count
+            }
+            for b in businesses
+        ]
+        
+        logger.info("Business search", query=q, results=len(results))
+        return results
+    
+    except Exception as e:
+        logger.error("Error searching businesses", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+class QueryRequest(BaseModel):
+    business_id: str
+    start_date: str  # ISO format: YYYY-MM-DD
+    end_date: str    # ISO format: YYYY-MM-DD
+    keywords: TypingList[str]  # Max 10 keywords
+
+@app.post("/api/query")
+async def query_keyword_analytics(request: QueryRequest):
+    """
+    Query keyword analytics for a business over a date range
+    
+    Filters reviews by business_id, date range, and keywords.
+    Returns KPIs, time series, by-keyword stats, quotes, and AI summary.
+    """
+    db = next(get_db())
+    
+    try:
+        # Validate keywords (max 10)
+        if len(request.keywords) > 10:
+            raise HTTPException(status_code=400, detail="Maximum 10 keywords allowed")
+        
+        if len(request.keywords) == 0:
+            raise HTTPException(status_code=400, detail="At least one keyword required")
+        
+        # Check cache
+        cache_key = _get_cache_key(request.business_id, request.start_date, request.end_date, request.keywords)
+        if cache_key in _query_cache and _is_cache_valid(_query_cache[cache_key]):
+            logger.info("Cache hit", cache_key=cache_key[:16])
+            return _query_cache[cache_key]['data']
+        
+        # Validate business exists
+        business = db.query(Business).filter(Business.id == request.business_id).first()
+        if not business:
+            raise HTTPException(status_code=404, detail="Business not found")
+        
+        # Parse dates
+        try:
+            start_dt = datetime.strptime(request.start_date, "%Y-%m-%d").date()
+            end_dt = datetime.strptime(request.end_date, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+        
+        if start_dt > end_dt:
+            raise HTTPException(status_code=400, detail="start_date must be before end_date")
+        
+        # Filter reviews by business and date range
+        from sqlalchemy import and_
+        reviews = db.query(Review).filter(
+            and_(
+                Review.business_id == request.business_id,
+                Review.date >= start_dt,
+                Review.date <= end_dt
+            )
+        ).all()
+        
+        if not reviews:
+            return {
+                "insufficient_data": True,
+                "message": "No reviews found in the specified date range",
+                "matched_reviews": 0
+            }
+        
+        # Match reviews by keywords
+        matched_reviews = []
+        for review in reviews:
+            review_text = (review.text or "").lower()
+            for keyword in request.keywords:
+                if _match_keyword_in_text(review_text, keyword):
+                    matched_reviews.append(review)
+                    break  # Review matches if any keyword matches
+        
+        if len(matched_reviews) < 25:
+            # Return partial results without LLM
+            return {
+                "insufficient_data": True,
+                "message": f"Only {len(matched_reviews)} reviews matched. Need at least 25 for AI summary.",
+                "matched_reviews": len(matched_reviews),
+                "total_reviews": len(reviews)
+            }
+        
+        # Compute sentiment for matched reviews
+        sentiments = []
+        stars = []
+        for review in matched_reviews:
+            text = review.text or ""
+            if text:
+                vs = _vader_analyzer.polarity_scores(text)
+                sentiments.append(vs['compound'])
+            if review.stars:
+                stars.append(review.stars)
+        
+        avg_sentiment = sum(sentiments) / len(sentiments) if sentiments else 0.0
+        sentiment_score = int((avg_sentiment + 1) * 50)  # Convert -1..1 to 0..100
+        avg_stars = sum(stars) / len(stars) if stars else 0.0
+        
+        # Compute prior period for deltas
+        # First, get the actual min date for this business to avoid "date out of range" errors
+        from sqlalchemy import func
+        min_date_result = db.query(func.min(Review.date)).filter(
+            Review.business_id == request.business_id
+        ).scalar()
+        
+        period_days = (end_dt - start_dt).days
+        prior_start = start_dt - timedelta(days=period_days)
+        prior_end = start_dt - timedelta(days=1)
+        
+        # Only calculate prior period if we have valid dates
+        if min_date_result and prior_start >= min_date_result and prior_end >= min_date_result:
+            prior_reviews = db.query(Review).filter(
+                and_(
+                    Review.business_id == request.business_id,
+                    Review.date >= prior_start,
+                    Review.date <= prior_end
+                )
+            ).all()
+        else:
+            prior_reviews = []
+        
+        prior_matched = []
+        for review in prior_reviews:
+            review_text = (review.text or "").lower()
+            for keyword in request.keywords:
+                if _match_keyword_in_text(review_text, keyword):
+                    prior_matched.append(review)
+                    break
+        
+        prior_sentiments = []
+        prior_stars = []
+        for review in prior_matched:
+            text = review.text or ""
+            if text:
+                vs = _vader_analyzer.polarity_scores(text)
+                prior_sentiments.append(vs['compound'])
+            if review.stars:
+                prior_stars.append(review.stars)
+        
+        prior_avg_sentiment = sum(prior_sentiments) / len(prior_sentiments) if prior_sentiments else 0.0
+        prior_sentiment_score = int((prior_avg_sentiment + 1) * 50)
+        prior_avg_stars = sum(prior_stars) / len(prior_stars) if prior_stars else 0.0
+        
+        deltas = {
+            "reviews": len(matched_reviews) - len(prior_matched),
+            "sentiment": sentiment_score - prior_sentiment_score,
+            "stars": round(avg_stars - prior_avg_stars, 2)
+        }
+        
+        # Generate time series (weekly for <=90d, monthly for >90d)
+        period_days = (end_dt - start_dt).days
+        if period_days <= 90:
+            # Weekly buckets
+            buckets = []
+            current = start_dt
+            while current <= end_dt:
+                week_end = min(current + timedelta(days=6), end_dt)
+                week_reviews = [r for r in matched_reviews if current <= r.date <= week_end]
+                if week_reviews:
+                    week_sentiments = []
+                    for r in week_reviews:
+                        if r.text:
+                            vs = _vader_analyzer.polarity_scores(r.text)
+                            week_sentiments.append(vs['compound'])
+                    avg_sent = sum(week_sentiments) / len(week_sentiments) if week_sentiments else 0.0
+                    buckets.append({
+                        "bucket": current.strftime("%Y-%m-%d"),
+                        "hits": len(week_reviews),
+                        "avg_sentiment": round(avg_sent, 3)
+                    })
+                current = week_end + timedelta(days=1)
+            time_series = buckets
+        else:
+            # Monthly buckets
+            buckets = []
+            current = start_dt.replace(day=1)
+            while current <= end_dt:
+                # Get last day of month
+                if current.month == 12:
+                    month_end = current.replace(year=current.year + 1, month=1, day=1) - timedelta(days=1)
+                else:
+                    month_end = current.replace(month=current.month + 1, day=1) - timedelta(days=1)
+                month_end = min(month_end, end_dt)
+                
+                month_reviews = [r for r in matched_reviews if current <= r.date <= month_end]
+                if month_reviews:
+                    month_sentiments = []
+                    for r in month_reviews:
+                        if r.text:
+                            vs = _vader_analyzer.polarity_scores(r.text)
+                            month_sentiments.append(vs['compound'])
+                    avg_sent = sum(month_sentiments) / len(month_sentiments) if month_sentiments else 0.0
+                    buckets.append({
+                        "bucket": current.strftime("%Y-%m"),
+                        "hits": len(month_reviews),
+                        "avg_sentiment": round(avg_sent, 3)
+                    })
+                # Move to next month
+                if current.month == 12:
+                    current = current.replace(year=current.year + 1, month=1, day=1)
+                else:
+                    current = current.replace(month=current.month + 1, day=1)
+            time_series = buckets
+        
+        # By keyword stats
+        by_keyword = []
+        total_keyword_hits = 0
+        keyword_hits_map = {}
+        
+        for keyword in request.keywords:
+            keyword_matched = [r for r in matched_reviews if _match_keyword_in_text((r.text or "").lower(), keyword)]
+            keyword_sentiments = []
+            for r in keyword_matched:
+                if r.text:
+                    vs = _vader_analyzer.polarity_scores(r.text)
+                    keyword_sentiments.append(vs['compound'])
+            avg_kw_sent = sum(keyword_sentiments) / len(keyword_sentiments) if keyword_sentiments else 0.0
+            hits = len(keyword_matched)
+            keyword_hits_map[keyword] = hits
+            total_keyword_hits += hits
+            
+            by_keyword.append({
+                "term": keyword,
+                "hits": hits,
+                "avg_sentiment": round(avg_kw_sent, 3)
+            })
+        
+        # Quotes (up to 2 positive & 2 negative per keyword) - with deduplication
+        quotes_by_keyword = {}
+        used_review_ids = set()  # Track used reviews to avoid duplicates
+        
+        for keyword in request.keywords:
+            keyword_matched = [r for r in matched_reviews if _match_keyword_in_text((r.text or "").lower(), keyword)]
+            positive_quotes = []
+            negative_quotes = []
+            
+            for review in keyword_matched:
+                # Skip if this review was already used for another keyword
+                if review.id in used_review_ids:
+                    continue
+                    
+                if not review.text:
+                    continue
+                    
+                vs = _vader_analyzer.polarity_scores(review.text)
+                text = review.text.strip()
+                
+                # Extract context around keyword
+                if len(text) > 160:
+                    text_lower = text.lower()
+                    kw_pos = text_lower.find(keyword.lower())
+                    if kw_pos >= 0:
+                        start = max(0, kw_pos - 60)
+                        end = min(len(text), kw_pos + len(keyword) + 60)
+                        text = text[start:end]
+                        if start > 0:
+                            text = "..." + text
+                        if end < len(review.text):
+                            text = text + "..."
+                    else:
+                        text = text[:160] + "..."
+                
+                quote_entry = {
+                    "text": text,
+                    "review_id": review.id,
+                    "sentiment": vs['compound']
+                }
+                
+                # Proper sentiment classification
+                if vs['compound'] >= 0.4 and len(positive_quotes) < 2:
+                    positive_quotes.append(quote_entry)
+                    used_review_ids.add(review.id)
+                elif vs['compound'] <= -0.2 and len(negative_quotes) < 2:
+                    negative_quotes.append(quote_entry)
+                    used_review_ids.add(review.id)
+                
+                if len(positive_quotes) >= 2 and len(negative_quotes) >= 2:
+                    break
+            
+            # If we don't have enough quotes, try unused reviews (but still respect sentiment)
+            if len(positive_quotes) < 2 or len(negative_quotes) < 2:
+                for review in keyword_matched:
+                    if review.id in used_review_ids:
+                        continue
+                    if not review.text:
+                        continue
+                    
+                    vs = _vader_analyzer.polarity_scores(review.text)
+                    text = review.text.strip()
+                    if len(text) > 160:
+                        text = text[:160] + "..."
+                    
+                    if vs['compound'] >= 0.4 and len(positive_quotes) < 2:
+                        positive_quotes.append({"text": text, "review_id": review.id, "sentiment": vs['compound']})
+                        used_review_ids.add(review.id)
+                    elif vs['compound'] <= -0.2 and len(negative_quotes) < 2:
+                        negative_quotes.append({"text": text, "review_id": review.id, "sentiment": vs['compound']})
+                        used_review_ids.add(review.id)
+                    
+                    if len(positive_quotes) >= 2 and len(negative_quotes) >= 2:
+                        break
+            
+            quotes_by_keyword[keyword] = {
+                "positive": [q["text"] for q in positive_quotes],
+                "negative": [q["text"] for q in negative_quotes]
+            }
+        
+        # Generate sparkline (last 7 buckets or all if < 7)
+        sparkline = [b["avg_sentiment"] for b in time_series[-7:]]
+        
+        # Prepare KPIs
+        kpis = {
+            "matched_reviews": len(matched_reviews),
+            "sentiment_score": sentiment_score,
+            "avg_stars": round(avg_stars, 2),
+            "deltas": deltas,
+            "sparkline": sparkline
+        }
+        
+        # LLM Summary (call Ollama with timeout)
+        summary_source = "fallback"
+        summary_data = {
+            "love": [],
+            "improve": [],
+            "recommendations": []
+        }
+        
+        try:
+            # Prepare detailed prompt for Ollama with sample quotes
+            sample_quotes_text = ""
+            for kw_stat in by_keyword[:3]:  # Top 3 keywords
+                kw_quotes = quotes_by_keyword.get(kw_stat['term'], {})
+                if kw_quotes.get('positive'):
+                    sample_quotes_text += f"\nPositive quote about '{kw_stat['term']}': {kw_quotes['positive'][0][:100]}..."
+                if kw_quotes.get('negative'):
+                    sample_quotes_text += f"\nNegative quote about '{kw_stat['term']}': {kw_quotes['negative'][0][:100]}..."
+            
+            prompt = f"""You are BizVista AI, an expert at analyzing restaurant customer feedback.
+
+Restaurant: {business.name}
+Analysis Period: {request.start_date} to {request.end_date}
+Total Reviews Analyzed: {len(matched_reviews)}
+
+Keywords Analyzed:
+"""
+            for kw_stat in by_keyword:
+                sentiment_pct = int((kw_stat['avg_sentiment'] + 1) * 50)
+                prompt += f"- '{kw_stat['term']}': {kw_stat['hits']} mentions, {sentiment_pct}% positive sentiment\n"
+            
+            prompt += f"""
+Sample Customer Quotes:{sample_quotes_text}
+
+Overall Sentiment Score: {sentiment_score}% (0-100 scale)
+Average Star Rating: {avg_stars:.1f}/5.0
+
+Generate actionable insights in JSON format:
+{{
+  "love": [3-5 specific things customers praise, reference actual keywords and numbers],
+  "improve": [3-5 specific areas needing attention, reference keywords with negative sentiment],
+  "recommendations": [3 concrete, actionable recommendations based on the data]
+}}
+
+Rules:
+- Be specific: mention keyword names, sentiment scores, mention counts
+- Reference actual customer feedback patterns
+- Recommendations must be actionable (not generic)
+- Total max 200 words across all fields
+- No generic phrases like "continue monitoring" or "focus on keywords"
+"""
+            
+            start_time = datetime.now()
+            llm_response = requests.post(
+                OLLAMA_URL,
+                json={
+                    "model": OLLAMA_MODEL,
+                    "prompt": prompt,
+                    "temperature": 0.4,
+                    "num_ctx": 2048,
+                    "num_predict": 400,
+                    "top_k": 40,
+                    "top_p": 0.9,
+                    "stream": False
+                },
+                timeout=60
+            )
+            elapsed = (datetime.now() - start_time).total_seconds()
+            
+            if elapsed <= 60 and llm_response.status_code == 200:
+                llm_data = llm_response.json()
+                llm_text = llm_data.get('response', '')
+                
+                # Try to extract JSON - improved regex to handle nested structures
+                import re
+                # Try to find JSON block (more flexible pattern)
+                json_patterns = [
+                    r'\{[^{}]*(?:"love"|"improve"|"recommendations")[^{}]*\}',  # Simple
+                    r'\{[^{}]*"love"[^{}]*"improve"[^{}]*"recommendations"[^{}]*\}',  # All three
+                    r'\{.*?"love".*?"improve".*?"recommendations".*?\}',  # With any content
+                ]
+                
+                for pattern in json_patterns:
+                    json_match = re.search(pattern, llm_text, re.DOTALL | re.IGNORECASE)
+                    if json_match:
+                        try:
+                            parsed = json.loads(json_match.group())
+                            # Validate structure and ensure all items are strings
+                            if 'love' in parsed and 'improve' in parsed and 'recommendations' in parsed:
+                                if isinstance(parsed['love'], list) and isinstance(parsed['improve'], list) and isinstance(parsed['recommendations'], list):
+                                    # Convert all items to strings (handle objects/dicts)
+                                    def ensure_strings(arr):
+                                        result = []
+                                        for item in arr:
+                                            if isinstance(item, str):
+                                                result.append(item)
+                                            elif isinstance(item, dict):
+                                                # If it's a dict, try to extract meaningful text
+                                                result.append(str(item.get('text', item.get('message', str(item)))))
+                                            else:
+                                                result.append(str(item))
+                                        return result
+                                    
+                                    summary_data = {
+                                        'love': ensure_strings(parsed['love']),
+                                        'improve': ensure_strings(parsed['improve']),
+                                        'recommendations': ensure_strings(parsed['recommendations'])
+                                    }
+                                    summary_source = "llm"
+                                    break
+                        except:
+                            continue
+            
+        except Exception as e:
+            logger.warning("LLM generation failed, using fallback", error=str(e))
+        
+        # Fallback if LLM didn't work - generate intelligent rule-based summary
+        if summary_source == "fallback":
+            # Generate love points from positive keywords
+            positive_keywords = [kw for kw in by_keyword if kw['avg_sentiment'] > 0.1]
+            positive_keywords.sort(key=lambda x: x['hits'], reverse=True)
+            
+            for kw_stat in positive_keywords[:5]:
+                sentiment_pct = int((kw_stat['avg_sentiment'] + 1) * 50)
+                summary_data['love'].append(f"'{kw_stat['term']}' mentioned {kw_stat['hits']} times with {sentiment_pct}% positive sentiment")
+            
+            # Generate improve points from negative keywords
+            negative_keywords = [kw for kw in by_keyword if kw['avg_sentiment'] < -0.1]
+            negative_keywords.sort(key=lambda x: x['hits'], reverse=True)
+            
+            for kw_stat in negative_keywords[:5]:
+                sentiment_pct = int((kw_stat['avg_sentiment'] + 1) * 50)
+                summary_data['improve'].append(f"'{kw_stat['term']}' mentioned {kw_stat['hits']} times with {sentiment_pct}% positive sentiment - needs attention")
+            
+            # Generate recommendations based on data patterns
+            if positive_keywords:
+                top_positive = positive_keywords[0]
+                summary_data['recommendations'].append(f"Leverage strength in '{top_positive['term']}' ({top_positive['hits']} mentions, {int((top_positive['avg_sentiment'] + 1) * 50)}% positive)")
+            
+            if negative_keywords:
+                top_negative = negative_keywords[0]
+                summary_data['recommendations'].append(f"Address concerns about '{top_negative['term']}' ({top_negative['hits']} mentions, {int((top_negative['avg_sentiment'] + 1) * 50)}% positive)")
+            
+            # Overall recommendation based on sentiment
+            if sentiment_score >= 70:
+                summary_data['recommendations'].append(f"Maintain high satisfaction (overall {sentiment_score}% positive sentiment)")
+            elif sentiment_score < 50:
+                summary_data['recommendations'].append(f"Focus on improving overall experience (currently {sentiment_score}% positive sentiment)")
+            else:
+                summary_data['recommendations'].append(f"Continue improving to reach higher satisfaction (currently {sentiment_score}% positive sentiment)")
+            
+            # Pad if needed (but avoid generic repeats)
+            if len(summary_data['love']) == 0:
+                summary_data['love'].append(f"Overall positive sentiment: {sentiment_score}% across {len(matched_reviews)} reviews")
+            if len(summary_data['improve']) == 0:
+                if sentiment_score < 60:
+                    summary_data['improve'].append(f"Overall sentiment below target ({sentiment_score}% - aim for 70%+)")
+                else:
+                    summary_data['improve'].append("Monitor for emerging negative trends")
+            if len(summary_data['recommendations']) < 3:
+                summary_data['recommendations'].append(f"Analyze {len(matched_reviews)} reviews for actionable patterns")
+        
+        # Ensure summary arrays contain only strings (final safety check)
+        def final_string_cleanup(arr):
+            return [str(item) if not isinstance(item, str) else item for item in arr]
+        
+        summary_data = {
+            'love': final_string_cleanup(summary_data.get('love', [])),
+            'improve': final_string_cleanup(summary_data.get('improve', [])),
+            'recommendations': final_string_cleanup(summary_data.get('recommendations', []))
+        }
+        
+        # Build response
+        response_data = {
+            "kpis": kpis,
+            "time_series": time_series,
+            "by_keyword": by_keyword,
+            "quotes_by_keyword": quotes_by_keyword,
+            "summary": summary_data,
+            "summary_source": summary_source,
+            "share_of_voice": {
+                keyword: round((hits / total_keyword_hits * 100) if total_keyword_hits > 0 else 0, 1)
+                for keyword, hits in keyword_hits_map.items()
+            },
+            "generated_at": datetime.now().isoformat()
+        }
+        
+        # Cache result
+        _query_cache[cache_key] = {
+            "data": response_data,
+            "timestamp": datetime.now()
+        }
+        
+        logger.info("Query completed", 
+                   business_id=request.business_id,
+                   keywords=len(request.keywords),
+                   matched=len(matched_reviews),
+                   source=summary_source)
+        
+        return response_data
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Error in query endpoint", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
 
 @app.get("/")
 async def root():
